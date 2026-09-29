@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+#
+# clip - copy stdin, files, or command output to your clipboard.
+#
+# Works over SSH by using the OSC 52 terminal escape sequence, so the text
+# lands in the clipboard of the machine you're sitting at. On a local desktop
+# it prefers native tools (wl-copy, xclip, xsel, pbcopy, clip.exe).
+#
+# Install:  install -m 755 clip ~/.local/bin/clip
+#
+set -uo pipefail
+
+PROG=${0##*/}
+VERSION=1.0.0
+
+MODE=auto        # auto | osc52 | native
+PASS=auto        # auto | tmux | screen | none   (OSC 52 wrapping)
+SEL=c            # OSC 52 selection: c p q s 0-7 (combinable, e.g. cp)
+TEE=0 NONL=0 TRIM=0 FORCE=0 QUIET=0 HEADER=0 FENCE=0 CLEAR=0
+LINES_MAX=""
+LANG_TAG=""
+EXEC_CMD=""
+MAXB=74994       # raw bytes; base64 of this is ~100000 chars, xterm's limit
+FILES=()
+
+have() { command -v "$1" >/dev/null 2>&1; }
+msg()  { ((QUIET)) || printf '%s: %s\n' "$PROG" "$*" >&2; }
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Usage: $PROG [options] [FILE ...]
+       command | $PROG [options]
+
+Copy text to the clipboard. With no FILE (or FILE = -), reads stdin.
+
+Input
+  FILE ...              copy the contents of one or more files
+  -e, --exec CMD        run CMD in bash and copy its output
+  -C, --clear           clear the clipboard instead of copying
+
+Output
+  -t, --tee             also print the input to stdout (works mid-pipeline,
+                        streams live: tail -f log | $PROG -t | grep ERR)
+  -q, --quiet           no status message on stderr
+
+Transform (applied in this order)
+  -l, --lines N         only the first N lines
+  -T, --trim            strip trailing whitespace and leading/trailing blank lines
+  -H, --header          prefix each FILE with a "==> name <==" header
+  -M, --md, --fence     wrap in a Markdown code fence
+  -L, --lang LANG       fence language tag (implies --fence)
+  -n, --no-newline      strip the trailing newline(s)
+
+Destination
+  -s, --selection SEL   OSC 52 target: c=clipboard (default), p=primary,
+                        q=secondary, s=select, 0-7=cut buffers; combine: cp
+  -P, --primary         shortcut for -s p
+  -m, --mode MODE       auto (default), osc52, or native
+                        auto = OSC 52 over SSH, native tool locally
+  -p, --passthrough W   auto (default), tmux, screen, or none
+                        how to wrap the OSC 52 sequence for multiplexers
+  -x, --max BYTES       size cap for OSC 52 (default $MAXB)
+  -F, --force           ignore the size cap and send anyway
+
+  -h, --help            show this help
+  -V, --version         show version
+
+Examples
+  ls -l | $PROG                       pipe into the clipboard
+  $PROG notes.txt                     copy a file
+  $PROG -H a.c b.c                    copy two files with headers
+  make 2>&1 | $PROG -t                see output AND copy it
+  $PROG -e 'git diff' -L diff         copy a diff as a Markdown block
+  cat key.pub | $PROG -n              copy without the trailing newline
+  $PROG -T -l 20 build.log            first 20 lines, tidied
+  $PROG -C                            clear the clipboard
+
+Notes
+  tmux needs:  set -g allow-passthrough on   (and set -g set-clipboard on)
+  Terminals with OSC 52: iTerm2, kitty, WezTerm, Alacritty, foot, Windows
+  Terminal, xterm (enable allowWindowOps). GNOME Terminal does not support it.
+EOF
+}
+
+# ---- argument parsing -------------------------------------------------------
+
+# Expand bundled short flags (-tn -> -t -n); flags that take a value go last
+# and are given separately (-s p).
+args=(); dd=0
+for a in "$@"; do
+  if ((dd)); then args+=("$a")
+  elif [[ $a == -- ]]; then dd=1; args+=("$a")
+  elif [[ $a =~ ^-[A-Za-z]{2,}$ ]]; then
+    for ((i = 1; i < ${#a}; i++)); do args+=("-${a:i:1}"); done
+  else args+=("$a"); fi
+done
+set -- "${args[@]+"${args[@]}"}"
+
+need() { [[ $# -ge 2 ]] || die "option $1 requires an argument"; }
+
+while (($#)); do
+  case $1 in
+    -t|--tee)         TEE=1 ;;
+    -n|--no-newline)  NONL=1 ;;
+    -T|--trim)        TRIM=1 ;;
+    -H|--header)      HEADER=1 ;;
+    -M|--md|--fence)  FENCE=1 ;;
+    -L|--lang)        need "$@"; LANG_TAG=$2; FENCE=1; shift ;;
+    -q|--quiet)       QUIET=1 ;;
+    -F|--force)       FORCE=1 ;;
+    -C|--clear)       CLEAR=1 ;;
+    -P|--primary)     SEL=p ;;
+    -s|--selection)   need "$@"; SEL=$2; shift ;;
+    -m|--mode)        need "$@"; MODE=$2; shift ;;
+    -p|--passthrough) need "$@"; PASS=$2; shift ;;
+    -l|--lines)       need "$@"; LINES_MAX=$2; shift ;;
+    -x|--max)         need "$@"; MAXB=$2; shift ;;
+    -e|--exec)        need "$@"; EXEC_CMD=$2; shift ;;
+    -h|--help)        usage; exit 0 ;;
+    -V|--version)     echo "$PROG $VERSION"; exit 0 ;;
+    --)               shift; FILES+=("$@"); break ;;
+    -)                FILES+=("-") ;;
+    -*)               die "unknown option: $1 (try --help)" ;;
+    *)                FILES+=("$1") ;;
+  esac
+  shift
+done
+
+[[ $SEL  =~ ^[cpqs0-7]+$ ]]        || die "invalid selection: $SEL"
+[[ $MODE == auto || $MODE == osc52 || $MODE == native ]] || die "invalid mode: $MODE"
+[[ $PASS =~ ^(auto|tmux|screen|none)$ ]] || die "invalid passthrough: $PASS"
+[[ -z $LINES_MAX || $LINES_MAX =~ ^[0-9]+$ ]] || die "--lines needs a number"
+[[ $MAXB =~ ^[0-9]+$ ]]            || die "--max needs a number"
+[[ -z $EXEC_CMD || ${#FILES[@]} -eq 0 ]] || die "use either --exec or FILEs, not both"
+
+# ---- gather input -----------------------------------------------------------
+
+WORKDIR=$(mktemp -d) || die "cannot create temp dir"
+trap 'rm -rf "$WORKDIR"' EXIT
+src=$WORKDIR/src
+work=$WORKDIR/work
+: >"$src"
+teed=0
+
+if ((CLEAR)); then
+  :
+elif [[ -n $EXEC_CMD ]]; then
+  if ((TEE)); then bash -c "$EXEC_CMD" | tee "$src"; teed=1
+  else bash -c "$EXEC_CMD" >"$src"; fi
+  rc=${PIPESTATUS[0]}
+  ((rc == 0)) || msg "command exited with status $rc (copying its output anyway)"
+elif ((${#FILES[@]})); then
+  for f in "${FILES[@]}"; do
+    [[ $f == - || -r $f ]] || die "cannot read: $f"
+  done
+  first=1
+  {
+    for f in "${FILES[@]}"; do
+      if ((HEADER)); then
+        ((first)) || printf '\n'
+        printf '==> %s <==\n' "$f"
+      fi
+      first=0
+      if [[ $f == - ]]; then cat; else cat -- "$f"; fi
+    done
+  } >"$src"
+else
+  [[ -t 0 ]] && msg "reading stdin (Ctrl-D to finish)"
+  if ((TEE)); then tee "$src" >/dev/stdout; teed=1; else cat >"$src"; fi
+fi
+
+((TEE && !teed)) && cat "$src"
+
+# ---- transform --------------------------------------------------------------
+
+cp -- "$src" "$work"
+apply() { "$@" <"$work" >"$work.new" && mv -- "$work.new" "$work"; }
+
+trim_fn() {
+  sed 's/[[:space:]]*$//' | awk '
+    NF { f = 1 }
+    f  { buf[++n] = $0 }
+    END { while (n > 0 && buf[n] ~ /^[[:space:]]*$/) n--
+          for (i = 1; i <= n; i++) print buf[i] }'
+}
+fence_fn() {
+  printf '```%s\n' "$LANG_TAG"
+  cat
+  [[ -n $(tail -c1 "$work") ]] && echo
+  printf '```\n'
+}
+strip_nl() { printf '%s' "$(cat)"; }
+
+[[ -n $LINES_MAX ]] && apply head -n "$LINES_MAX"
+((TRIM))  && apply trim_fn
+((FENCE)) && apply fence_fn
+((NONL))  && apply strip_nl
+
+bytes=$(wc -c <"$work" | tr -d ' ')
+lines=$(wc -l <"$work" | tr -d ' ')
+
+if ((!CLEAR && bytes == 0)); then
+  msg "nothing to copy"
+  exit 1
+fi
+
+# ---- destinations -----------------------------------------------------------
+
+NATIVE=()
+pick_native() {
+  NATIVE=()
+  local name=clipboard
+  [[ $SEL == p ]] && name=primary
+  if   [[ -n ${WAYLAND_DISPLAY:-} ]] && have wl-copy; then
+    NATIVE=(wl-copy); [[ $name == primary ]] && NATIVE+=(--primary)
+  elif [[ -n ${DISPLAY:-} ]] && have xclip; then
+    NATIVE=(xclip -in -selection "$name")
+  elif [[ -n ${DISPLAY:-} ]] && have xsel; then
+    NATIVE=(xsel --input "--$name")
+  elif have pbcopy;              then NATIVE=(pbcopy)
+  elif have clip.exe;            then NATIVE=(clip.exe)
+  elif have termux-clipboard-set; then NATIVE=(termux-clipboard-set)
+  fi
+  ((${#NATIVE[@]}))
+}
+
+emit_native() { "${NATIVE[@]}" <"$work" >/dev/null 2>&1; }
+
+emit_osc52() {
+  local out=/dev/tty b64 pass=$PASS
+  { : >/dev/tty; } 2>/dev/null || out=/dev/stderr
+
+  if ((!FORCE && bytes > MAXB)); then
+    die "payload is $bytes bytes; most terminals cap OSC 52 near $MAXB (use -F to try anyway, -x to change the cap)"
+  fi
+
+  b64=$(base64 <"$work" | tr -d '\r\n')
+  ((CLEAR)) && b64=""
+
+  if [[ $pass == auto ]]; then
+    if   [[ -n ${TMUX:-} ]]; then pass=tmux
+    elif [[ -n ${STY:-}  ]]; then pass=screen
+    else pass=none; fi
+  fi
+
+  case $pass in
+    none)
+      printf '\033]52;%s;%s\a' "$SEL" "$b64" >"$out" ;;
+    tmux)   # inner ESCs doubled; needs "allow-passthrough on"
+      printf '\033Ptmux;\033\033]52;%s;%s\a\033\\' "$SEL" "$b64" >"$out" ;;
+    screen) # GNU screen limits DCS chunks, so split into 76-char pieces
+      {
+        printf '\033P\033]52;%s;' "$SEL"
+        printf '%s' "$b64" | fold -w 76 |
+          awk 'NR > 1 { printf "\033\\\033P" } { printf "%s", $0 }'
+        printf '\a\033\\'
+      } >"$out" ;;
+  esac
+  via="osc52${pass:+/$pass}"
+}
+
+via=""
+mode=$MODE
+if [[ $mode == auto ]]; then
+  if [[ -n ${SSH_CONNECTION:-}${SSH_TTY:-}${SSH_CLIENT:-} ]]; then mode=osc52
+  elif pick_native; then mode=native
+  else mode=osc52; fi
+fi
+
+if [[ $mode == native ]]; then
+  if pick_native && emit_native; then
+    via="native (${NATIVE[0]})"
+  else
+    msg "no working native clipboard tool; falling back to OSC 52"
+    emit_osc52
+  fi
+else
+  emit_osc52
+fi
+
+if ((CLEAR)); then msg "clipboard cleared via $via"
+else msg "copied $bytes bytes, $lines lines -> [$SEL] via $via"; fi
